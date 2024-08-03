@@ -1,8 +1,13 @@
-import tensorflow as tf
 import os
 import time
+import numpy as np
+import tensorflow as tf
 from matplotlib import pyplot as plt
 from pathlib import Path
+from skimage.color import rgb2lab, lab2rgb
+from skimage.metrics import structural_similarity as ssim
+from colormath.color_objects import LabColor
+from colormath.color_diff import delta_e_cie2000
 
 # Parâmetros
 BUFFER_SIZE = 400
@@ -17,8 +22,7 @@ path_test_diseased = Path('./Projeto_Ramularia/Disease_Test100')
 
 # Funções de pré-processamento
 def resize(image, height, width):
-    image = tf.image.resize(image, [height, width], method=tf.image.ResizeMethod.NEAREST_NEIGHBOR)
-    return image
+    return tf.image.resize(image, [height, width], method=tf.image.ResizeMethod.NEAREST_NEIGHBOR)
 
 def random_jitter(image):
     image = tf.image.resize(image, [286, 286])
@@ -26,20 +30,9 @@ def random_jitter(image):
     if tf.random.uniform(()) > 0.5:
         image = tf.image.flip_left_right(image)
     return image
-
-def random_crop(image):
-    cropped_image = tf.image.random_crop(image, size=[IMG_HEIGHT, IMG_WIDTH, 3])
-    return cropped_image
 
 def normalize(image):
     return (image / 127.5) - 1
-
-def random_jitter(image):
-    image = tf.image.resize(image, [286, 286])
-    image = tf.image.random_crop(image, size=[IMG_HEIGHT, IMG_WIDTH, 3])
-    if tf.random.uniform(()) > 0.5:
-        image = tf.image.flip_left_right(image)
-    return image
 
 def load_and_preprocess_image(image_path, apply_jitter=False):
     image = tf.io.read_file(image_path)
@@ -127,7 +120,7 @@ def unet_model(output_channels):
     skips = reversed(skips[:-1])
     for up, skip in zip(up_stack, skips):
         x = up(x)
-        x = tf.keras.layers.Concatenate()( [x, skip] )
+        x = tf.keras.layers.Concatenate()([x, skip])
 
     x = last(x)
     return tf.keras.Model(inputs=inputs, outputs=x)
@@ -204,13 +197,15 @@ checkpoint = tf.train.Checkpoint(generator_optimizer=gen_optimizer,
                                  generator=generator,
                                  discriminator=discriminator)
 
-EPOCHS = 20
+EPOCHS = 50
 early_stopping_patience = 5
+
 best_gen_loss = float('inf')
 epochs_since_last_improvement = 0
 
 for epoch in range(EPOCHS):
     start = time.time()
+
     total_gen_loss = 0
     total_disc_loss = 0
 
@@ -253,10 +248,65 @@ def display_sample_image(input_image, generated_image):
 
     plt.show()
 
+def rgb_to_lab(rgb_image):
+    # RGB para LAB
+    return rgb2lab(rgb_image)
+
+def calculate_ciede2000_anomaly_score(original_image, generated_image):
+    # Converter as imagens RGB para LAB
+    original_lab = rgb_to_lab(original_image)
+    generated_lab = rgb_to_lab(generated_image)
+    
+    # Flatten as imagens para calcular o CIEDE2000 para cada pixel
+    original_lab_flat = original_lab.reshape(-1, 3)
+    generated_lab_flat = generated_lab.reshape(-1, 3)
+    
+    # Calcula a diferença de cor para cada pixel
+    total_delta_e = 0
+    num_pixels = original_lab_flat.shape[0]
+    
+    for i in range(num_pixels):
+        original_pixel = LabColor(*original_lab_flat[i])
+        generated_pixel = LabColor(*generated_lab_flat[i])
+        delta_e = delta_e_cie2000(original_pixel, generated_pixel)
+        total_delta_e += delta_e
+    
+    # Calcula a pontuação média de anomalia
+    average_delta_e = total_delta_e / num_pixels
+    return average_delta_e
+
 # Testar o modelo com uma imagem do dataset de teste
 for input_image, target in test_dataset.take(1):
     prediction = generator(input_image, training=False)
     display_sample_image(input_image[0], prediction[0])
+    
+    # Testar o cálculo da pontuação de anomalia
+    input_image_np = (input_image[0] + 1) / 2  # Reverter normalização
+    prediction_np = (prediction[0] + 1) / 2  # Reverter normalização
+    anomaly_score = calculate_ciede2000_anomaly_score(input_image_np.numpy(), prediction_np.numpy())
+    print(f'Anomaly Score: {anomaly_score}')
 
 generator.save('pix2pix_generator.h5')
 discriminator.save('pix2pix_discriminator.h5')
+
+def load_image_from_path(image_path, apply_jitter=False):
+    image = tf.io.read_file(image_path)
+    image = tf.io.decode_jpeg(image)
+    image = tf.cast(image, tf.float32)
+    image = resize(image, IMG_HEIGHT, IMG_WIDTH)
+    if apply_jitter:
+        image = random_jitter(image)
+    image = normalize(image)
+    return tf.expand_dims(image, 0)  # Adiciona uma dimensão para o batch
+
+# Caminho da imagem específica para teste
+specific_image_path = 'Projeto_Ramularia/Disease_Test100/a984-987 ad_1.jpg'
+
+# Carregar e pré-processar a imagem
+input_image = load_image_from_path(specific_image_path, apply_jitter=False)
+
+# Gerar a imagem a partir do gerador
+generated_image = generator(input_image, training=False)
+
+# Exibir a imagem original e a imagem gerada
+display_sample_image(input_image[0], generated_image[0])
