@@ -1,17 +1,14 @@
 import tensorflow as tf
 import os
-import pathlib
 import time
-import datetime
 from matplotlib import pyplot as plt
-from IPython import display
 from pathlib import Path
 
 # Parâmetros
 BUFFER_SIZE = 400
-BATCH_SIZE = 1
-IMG_WIDTH = 256
-IMG_HEIGHT = 256
+BATCH_SIZE = 8
+IMG_WIDTH = 128
+IMG_HEIGHT = 128
 
 # Caminhos das pastas de treinamento e teste
 path_train = Path('./Projeto_Ramularia/Healthy_Train50')
@@ -23,15 +20,6 @@ def resize(image, height, width):
     image = tf.image.resize(image, [height, width], method=tf.image.ResizeMethod.NEAREST_NEIGHBOR)
     return image
 
-def random_crop(image):
-    cropped_image = tf.image.random_crop(image, size=[IMG_HEIGHT, IMG_WIDTH, 3])
-    return cropped_image
-
-# Função de normalização
-def normalize(image):
-    return (image / 127.5) - 1
-
-# Função de jitter aleatório
 def random_jitter(image):
     image = tf.image.resize(image, [286, 286])
     image = tf.image.random_crop(image, size=[IMG_HEIGHT, IMG_WIDTH, 3])
@@ -39,75 +27,236 @@ def random_jitter(image):
         image = tf.image.flip_left_right(image)
     return image
 
-# Função para carregar e pré-processar imagem
-def load_and_preprocess_image(image_path, apply_jitter=False):
-    # Lê e decodifica a imagem
-    image = tf.io.read_file(image_path)
-    image = tf.io.decode_jpeg(image)
+def random_crop(image):
+    cropped_image = tf.image.random_crop(image, size=[IMG_HEIGHT, IMG_WIDTH, 3])
+    return cropped_image
 
-    # Converte a imagem para tf.float32
-    image = tf.cast(image, tf.float32)
+def normalize(image):
+    return (image / 127.5) - 1
 
-    # Redimensiona inicialmente para 256x256
-    image = resize(image, IMG_HEIGHT, IMG_WIDTH)
-
-    if apply_jitter:
-        # Aplica jitter aleatório (para treinamento)
-        image = random_jitter(image)
-
-    # Normaliza a imagem
-    image = normalize(image)
-
+def random_jitter(image):
+    image = tf.image.resize(image, [286, 286])
+    image = tf.image.random_crop(image, size=[IMG_HEIGHT, IMG_WIDTH, 3])
+    if tf.random.uniform(()) > 0.5:
+        image = tf.image.flip_left_right(image)
     return image
 
-# Função de carregamento e pré-processamento para treinamento
+def load_and_preprocess_image(image_path, apply_jitter=False):
+    image = tf.io.read_file(image_path)
+    image = tf.io.decode_jpeg(image)
+    image = tf.cast(image, tf.float32)
+    image = resize(image, IMG_HEIGHT, IMG_WIDTH)
+    if apply_jitter:
+        image = random_jitter(image)
+    image = normalize(image)
+    return image
+
 def load_image_train(image_file):
-    return load_and_preprocess_image(image_file, apply_jitter=True)
+    image = load_and_preprocess_image(image_file, apply_jitter=True)
+    return image, image
 
-# Função de carregamento e pré-processamento para teste com etiqueta
-def load_image_test(image_file, label):
-    image = load_and_preprocess_image(image_file, apply_jitter=False)
-    return image, label
-
-
-# Criação do pipeline de entrada para treinamento
 train_dataset = tf.data.Dataset.list_files(str(path_train / '*.jpg'))
 train_dataset = train_dataset.map(lambda x: load_image_train(x), num_parallel_calls=tf.data.AUTOTUNE)
 train_dataset = train_dataset.shuffle(BUFFER_SIZE)
 train_dataset = train_dataset.batch(BATCH_SIZE)
+train_dataset = train_dataset.prefetch(buffer_size=tf.data.AUTOTUNE)
 
-# Criação do pipeline de entrada para teste (dois diretórios com etiquetas)
+def load_image_test(image_file, label):
+    image = load_and_preprocess_image(image_file, apply_jitter=False)
+    return image, label
+
 test_dataset_healthy = tf.data.Dataset.list_files(str(path_test_healthy / '*.jpg'))
 test_dataset_diseased = tf.data.Dataset.list_files(str(path_test_diseased / '*.jpg'))
 
 test_dataset_healthy = test_dataset_healthy.map(lambda x: load_image_test(x, 0), num_parallel_calls=tf.data.AUTOTUNE)
 test_dataset_diseased = test_dataset_diseased.map(lambda x: load_image_test(x, 1), num_parallel_calls=tf.data.AUTOTUNE)
 
-# Concatenar os dois datasets de teste
 test_dataset = test_dataset_healthy.concatenate(test_dataset_diseased)
 test_dataset = test_dataset.batch(BATCH_SIZE)
+test_dataset = test_dataset.prefetch(buffer_size=tf.data.AUTOTUNE)
 
-# print(f"Number of images in test_dataset: {test_dataset.cardinality().numpy()}") # Checando se juntou corretamente os datasets de teste
+def downsample(filters, size, apply_batchnorm=True):
+    initializer = tf.random_normal_initializer(0., 0.02)
+    result = tf.keras.Sequential()
+    result.add(
+        tf.keras.layers.Conv2D(filters, size, strides=2, padding='same', 
+                               kernel_initializer=initializer, use_bias=False))
+    if apply_batchnorm:
+        result.add(tf.keras.layers.BatchNormalization())
+    result.add(tf.keras.layers.ReLU())
+    return result
 
-"""
-# Exibir algumas imagens de treinamento
-for image_batch in train_dataset.take(1):
-    plt.figure(figsize=(6, 6))
-    batch_size = image_batch.shape[0]
-    for i in range(min(4, batch_size)):
-        plt.subplot(2, 2, i + 1)
-        plt.imshow((image_batch[i] + 1) / 2)  # Converte a imagem de volta para o intervalo [0, 1] para exibição
-        plt.axis('off')
+def upsample(filters, size, dropout=True):
+    initializer = tf.random_normal_initializer(0., 0.02)
+    result = tf.keras.Sequential()
+    result.add(
+        tf.keras.layers.Conv2DTranspose(filters, size, strides=2, padding='same', 
+                                         kernel_initializer=initializer, use_bias=False))
+    result.add(tf.keras.layers.BatchNormalization())
+    if dropout:
+        result.add(tf.keras.layers.Dropout(0.5))
+    result.add(tf.keras.layers.ReLU())
+    return result
+
+def unet_model(output_channels):
+    inputs = tf.keras.layers.Input(shape=[IMG_HEIGHT, IMG_WIDTH, 3])
+
+    down_stack = [
+        downsample(64, 4, apply_batchnorm=False),
+        downsample(128, 4),
+        downsample(256, 4),
+        downsample(512, 4),
+    ]
+
+    up_stack = [
+        upsample(256, 4, dropout=True),
+        upsample(128, 4),
+        upsample(64, 4),
+    ]
+
+    last = tf.keras.layers.Conv2DTranspose(output_channels, 4, strides=2, padding='same',
+                                           kernel_initializer=tf.random_normal_initializer(0., 0.02),
+                                           activation='tanh')
+
+    x = inputs
+    skips = []
+    for down in down_stack:
+        x = down(x)
+        skips.append(x)
+    
+    skips = reversed(skips[:-1])
+    for up, skip in zip(up_stack, skips):
+        x = up(x)
+        x = tf.keras.layers.Concatenate()( [x, skip] )
+
+    x = last(x)
+    return tf.keras.Model(inputs=inputs, outputs=x)
+
+def discriminator_model():
+    initializer = tf.random_normal_initializer(0., 0.02)
+    input_img = tf.keras.layers.Input(shape=[IMG_HEIGHT, IMG_WIDTH, 3], name='input_image')
+    target_img = tf.keras.layers.Input(shape=[IMG_HEIGHT, IMG_WIDTH, 3], name='target_image')
+    
+    x = tf.keras.layers.Concatenate()([input_img, target_img])
+
+    x = tf.keras.layers.Conv2D(64, 4, strides=2, padding='same', kernel_initializer=initializer)(x)
+    x = tf.keras.layers.LeakyReLU()(x)
+    x = tf.keras.layers.Dropout(0.5)(x)
+
+    x = tf.keras.layers.Conv2D(128, 4, strides=2, padding='same', kernel_initializer=initializer)(x)
+    x = tf.keras.layers.LeakyReLU()(x)
+    x = tf.keras.layers.Dropout(0.5)(x)
+
+    x = tf.keras.layers.Conv2D(256, 4, strides=2, padding='same', kernel_initializer=initializer)(x)
+    x = tf.keras.layers.LeakyReLU()(x)
+    x = tf.keras.layers.Dropout(0.5)(x)
+
+    x = tf.keras.layers.Conv2D(512, 4, strides=1, padding='same', kernel_initializer=initializer)(x)
+    x = tf.keras.layers.LeakyReLU()(x)
+    x = tf.keras.layers.Dropout(0.5)(x)
+
+    x = tf.keras.layers.Conv2D(1, 4, strides=1, padding='same', kernel_initializer=initializer)(x)
+
+    return tf.keras.Model(inputs=[input_img, target_img], outputs=x)
+
+def discriminator_loss(disc_real_output, disc_generated_output):
+    real_loss = tf.keras.losses.BinaryCrossentropy(from_logits=True)(tf.ones_like(disc_real_output), disc_real_output)
+    generated_loss = tf.keras.losses.BinaryCrossentropy(from_logits=True)(tf.zeros_like(disc_generated_output), disc_generated_output)
+    total_disc_loss = real_loss + generated_loss
+    return total_disc_loss
+
+def generator_loss(generated_output, target, gen_output):
+    l1_loss = tf.keras.losses.MeanAbsoluteError()(target, gen_output)
+    gan_loss = tf.keras.losses.BinaryCrossentropy(from_logits=True)(tf.ones_like(generated_output), generated_output)
+    total_gen_loss = gan_loss + LAMBDA * l1_loss
+    return total_gen_loss
+
+@tf.function
+def train_step(input_image, target, generator, discriminator, gen_optimizer, disc_optimizer):
+    with tf.GradientTape() as gen_tape, tf.GradientTape() as disc_tape:
+        gen_output = generator(input_image, training=True)
+        disc_real_output = discriminator([input_image, target], training=True)
+        disc_generated_output = discriminator([input_image, gen_output], training=True)
+
+        gen_loss = generator_loss(disc_generated_output, target, gen_output)
+        disc_loss = discriminator_loss(disc_real_output, disc_generated_output)
+
+    gradients_of_generator = gen_tape.gradient(gen_loss, generator.trainable_variables)
+    gradients_of_discriminator = disc_tape.gradient(disc_loss, discriminator.trainable_variables)
+
+    gen_optimizer.apply_gradients(zip(gradients_of_generator, generator.trainable_variables))
+    disc_optimizer.apply_gradients(zip(gradients_of_discriminator, discriminator.trainable_variables))
+
+    return gen_loss, disc_loss
+
+LAMBDA = 100
+
+generator = unet_model(output_channels=3)
+discriminator = discriminator_model()
+
+gen_optimizer = tf.keras.optimizers.Adam(1e-4, beta_1=0.5)
+disc_optimizer = tf.keras.optimizers.Adam(1e-4, beta_1=0.5)
+
+checkpoint_dir = './training_checkpoints'
+checkpoint_prefix = os.path.join(checkpoint_dir, "ckpt")
+checkpoint = tf.train.Checkpoint(generator_optimizer=gen_optimizer,
+                                 discriminator_optimizer=disc_optimizer,
+                                 generator=generator,
+                                 discriminator=discriminator)
+
+EPOCHS = 20
+early_stopping_patience = 5
+best_gen_loss = float('inf')
+epochs_since_last_improvement = 0
+
+for epoch in range(EPOCHS):
+    start = time.time()
+    total_gen_loss = 0
+    total_disc_loss = 0
+
+    for input_image, target in train_dataset:
+        gen_loss, disc_loss = train_step(input_image, target, generator, discriminator, gen_optimizer, disc_optimizer)
+        total_gen_loss += gen_loss
+        total_disc_loss += disc_loss
+
+    avg_gen_loss = total_gen_loss / len(train_dataset)
+    avg_disc_loss = total_disc_loss / len(train_dataset)
+
+    print(f'Epoch {epoch+1}/{EPOCHS}, Generator Loss: {avg_gen_loss.numpy()}, Discriminator Loss: {avg_disc_loss.numpy()}')
+
+    if avg_gen_loss < best_gen_loss:
+        best_gen_loss = avg_gen_loss
+        epochs_since_last_improvement = 0
+        checkpoint.save(file_prefix=checkpoint_prefix)
+    else:
+        epochs_since_last_improvement += 1
+        if epochs_since_last_improvement >= early_stopping_patience:
+            print("Early stopping triggered. Training stopped.")
+            break
+
+    print(f'Tempo de Epoch {epoch+1}: {time.time() - start} segundos')
+
+def display_sample_image(input_image, generated_image):
+    plt.figure(figsize=(12, 6))
+
+    # Display input image
+    plt.subplot(1, 2, 1)
+    plt.title('Input Image')
+    plt.imshow((input_image + 1) / 2)  # Reverter normalização para exibição
+    plt.axis('off')
+
+    # Display generated image
+    plt.subplot(1, 2, 2)
+    plt.title('Generated Image')
+    plt.imshow((generated_image + 1) / 2)  # Reverter normalização para exibição
+    plt.axis('off')
+
     plt.show()
-"""
 
-# Exibir algumas imagens de teste com etiquetas
-for image_batch, label_batch in test_dataset.take(1):
-    plt.figure(figsize=(6, 6))
-    batch_size = image_batch.shape[0]
-    for i in range(batch_size):
-        plt.subplot(2, 2, i + 1)
-        plt.imshow((image_batch[i] + 1) / 2)  # Converte a imagem de volta para o intervalo [0, 1] para exibição
-        plt.title('Healthy' if label_batch[i] == 0 else 'Diseased')
-        plt.axis('off')
-    plt.show()
+# Testar o modelo com uma imagem do dataset de teste
+for input_image, target in test_dataset.take(1):
+    prediction = generator(input_image, training=False)
+    display_sample_image(input_image[0], prediction[0])
+
+generator.save('pix2pix_generator.h5')
+discriminator.save('pix2pix_discriminator.h5')
